@@ -20,7 +20,12 @@
 #include <cuda_fp16.h>
 #include <cuda_fp8.h>
 #include <cuda_fp4.h>
+#include <cuda.h>
+#include <cstdint>
 #include <cstdlib>
+#include <mutex>
+#include <type_traits>
+#include <vector>
 
 namespace sparkinfer { namespace kernels {
 
@@ -218,6 +223,23 @@ struct Smem {
     unsigned long long mb[4 * NS];
 };
 
+// WT: the decode warps read their weight words from shared memory. A decode warp owns 16 weight
+// rows, so each of its four 4-byte global loads a stage touched 16 cache lines: ~530 L1 wavefronts
+// a stage per SM, on the same data pipe as the MMA warps' ldmatrix (~450) and the byte table
+// (~350). One tensor copy a warp now brings its rows' next four blocks (16 rows x 112 bytes; a
+// row's four blocks are one 16-byte aligned run since nblk % 4 == 0) into a double buffer, and the
+// words come back by LDS with at most 2-way conflicts, ~90 wavefronts a stage. Same bytes, same B
+// stage: the output is bit-identical. SPARKINFER_PTQ1_FP4_WTMA=0 turns it off.
+constexpr int kGrpBlk = 4, kGrpBytes = kGrpBlk * kBlkBytes, kGrpRows = 16, N_DW = N_DEC / 32;
+template <int NS>
+struct SmemW : Smem<NS> {
+    alignas(128) unsigned char raw[N_DW][2][kGrpRows * kGrpBytes];
+    unsigned long long rmb[N_DW][2];
+};
+struct WMaps {
+    CUtensorMap m[MAX_LEGS];
+};
+
 struct Legs {
     const unsigned char* w[MAX_LEGS];
     __nv_bfloat16* c[MAX_LEGS];
@@ -362,14 +384,16 @@ __device__ __forceinline__ void store_tile(const float (&acc)[4][4][4], const Le
         }
 }
 
-template <bool RESID, bool FOLD>
+template <bool RESID, bool FOLD, bool WT>
 __global__ void __launch_bounds__(Ring<FOLD>::THREADS, 1)
 ptq1_fp4_gemm_kernel(const unsigned char* __restrict__ a, int M, int K, Legs L,
                      float* __restrict__ part, int nblk_split, int mtiles, int ntiles, int nitems,
-                     float alpha) {
+                     float alpha, const __grid_constant__ WMaps wmaps) {
+    static_assert(!WT || FOLD, "WT is built on the FOLD layout");
     constexpr int NS = Ring<FOLD>::NS, THREADS = Ring<FOLD>::THREADS;
+    using SM = std::conditional_t<WT, SmemW<NS>, Smem<NS>>;
     extern __shared__ __align__(128) unsigned char smem_raw[];
-    Smem<NS>& sm = *reinterpret_cast<Smem<NS>*>(smem_raw);
+    SM& sm = *reinterpret_cast<SM*>(smem_raw);
     const unsigned mb0 = smem_u32(&sm.mb[0]);
     auto fullA  = [&](int s) { return mb0 + 8u * (unsigned)s; };
     auto emptyA = [&](int s) { return mb0 + 8u * (unsigned)(NS + s); };
@@ -384,6 +408,11 @@ ptq1_fp4_gemm_kernel(const unsigned char* __restrict__ a, int M, int K, Legs L,
             mb_init(fullB(s), N_DEC);
             mb_init(emptyB(s), N_MMA / 32);
         }
+        if constexpr (WT)
+            for (int w = 0; w < N_DW; w++) {
+                mb_init(smem_u32(&sm.rmb[w][0]), 1);
+                mb_init(smem_u32(&sm.rmb[w][1]), 1);
+            }
         asm volatile("fence.mbarrier_init.release.cluster;" ::: "memory");
     }
     __syncthreads();
@@ -458,6 +487,70 @@ ptq1_fp4_gemm_kernel(const unsigned char* __restrict__ a, int M, int K, Legs L,
             mb_cp_arrive(fullA(s));
         };
         int g = 0;
+        if constexpr (WT) {
+            // This warp's 16 weight rows come in groups of four blocks, two groups in flight. A
+            // stage's words are read from the group, so the decode itself is unchanged.
+            const int dw = d >> 5, dl = d & 31, rr = br & (kGrpRows - 1);
+            int gs = 0;   // groups this warp has used: buffer gs & 1, its (gs >> 1)-th fill
+            auto grp_issue = [&](int seq, int q, int leg, int n0) {
+                if (dl != 0) return;
+                const int b = seq & 1;
+                const unsigned bar = smem_u32(&sm.rmb[dw][b]);
+                asm volatile("mbarrier.arrive.expect_tx.shared::cta.b64 _, [%0], %1;"
+                             :: "r"(bar), "r"(kGrpRows * kGrpBytes) : "memory");
+                asm volatile("cp.async.bulk.tensor.2d.shared::cluster.global.mbarrier::complete_tx::bytes"
+                             " [%0], [%1, {%2, %3}], [%4];"
+                             :: "r"(smem_u32(sm.raw[dw][b])), "l"(&wmaps.m[leg]), "r"(q * kGrpBytes),
+                                "r"(n0 + kGrpRows * dw), "r"(bar) : "memory");
+            };
+            auto words = [&](int seq, int kb, unsigned (&t)[4]) {
+                const unsigned* bw = reinterpret_cast<const unsigned*>(
+                    sm.raw[dw][seq & 1] + rr * kGrpBytes + (kb & (kGrpBlk - 1)) * kBlkBytes);
+                t[0] = bw[2 * h];
+                t[1] = bw[2 * h + 1];
+                t[2] = bw[4 + h];
+                t[3] = bw[6];
+            };
+            for (int w = blockIdx.x; w < nitems; w += gridDim.x) {
+                int mt, leg, n0, kb0, nst;
+                item(w, mt, leg, n0, kb0, nst);
+                const int m0 = mt * BM;
+                const int q0 = kb0 / kGrpBlk, ng = (kb0 + nst - 1) / kGrpBlk - q0 + 1;
+                grp_issue(gs, q0, leg, n0);
+                if (ng > 1) grp_issue(gs + 1, q0 + 1, leg, n0);
+                int ready = 0, freed = 0;   // this item's groups waited for, and given back
+                for (int i = 0; i < nst; i += 2) {
+                    const bool two = i + 1 < nst;
+                    const int ga = (kb0 + i) / kGrpBlk - q0;
+                    const int gb = (kb0 + i + (two ? 1 : 0)) / kGrpBlk - q0;
+                    for (; ready <= gb; ready++)
+                        mb_wait(smem_u32(&sm.rmb[dw][(gs + ready) & 1]), ((gs + ready) >> 1) & 1);
+                    unsigned t0[4], t1[4];
+                    words(gs + ga, kb0 + i, t0);
+                    if (two) words(gs + gb, kb0 + i + 1, t1);
+                    // A group no later stage reads is refilled with the one two ahead, once every
+                    // lane is done with it.
+                    const int keep = i + 2 < nst ? (kb0 + i + 2) / kGrpBlk - q0 : ng;
+                    if (freed < keep) {
+                        __syncwarp();
+#pragma unroll 1
+                        for (; freed < keep; freed++)
+                            if (freed + 2 < ng) grp_issue(gs + freed + 2, q0 + freed + 2, leg, n0);
+                    }
+                    const int s0 = g % NS, s1 = (g + 1) % NS;
+                    if (g >= NS) mb_wait(emptyB(s0), ((g / NS) - 1) & 1);
+                    if (two && g + 1 >= NS) mb_wait(emptyB(s1), (((g + 1) / NS) - 1) & 1);
+                    load_a(s0, kb0 + i, m0);
+                    if (two) load_a(s1, kb0 + i + 1, m0);
+                    decode_half(t0, h, br, sm.lut, sm.b[s0], &sm.bsf[s0][br]);
+                    if (two) decode_half(t1, h, br, sm.lut, sm.b[s1], &sm.bsf[s1][br]);
+                    mb_arrive(fullB(s0));
+                    if (two) mb_arrive(fullB(s1));
+                    g += two ? 2 : 1;
+                }
+                gs += ng;
+            }
+        } else
         for (int w = blockIdx.x; w < nitems; w += gridDim.x) {
             int mt, leg, n0, kb0, nst;
             item(w, mt, leg, n0, kb0, nst);
@@ -583,6 +676,41 @@ int pick_splits(int tiles, int nblk, size_t per_split_floats, size_t part_cap) {
     return best;
 }
 
+// A 2D tensor map over a [n][nblk * 28] weight matrix, box 112 bytes x 16 rows. Encoded once per
+// (pointer, shape) and kept: the weights live as long as the model.
+bool weight_group_map(CUtensorMap* m, const void* w, int n, int nblk) {
+    using Enc = CUresult (*)(CUtensorMap*, CUtensorMapDataType, cuuint32_t, void*, const cuuint64_t*,
+                             const cuuint64_t*, const cuuint32_t*, const cuuint32_t*,
+                             CUtensorMapInterleave, CUtensorMapSwizzle, CUtensorMapL2promotion,
+                             CUtensorMapFloatOOBfill);
+    static Enc enc = [] {
+        void* f = nullptr;
+        cudaDriverEntryPointQueryResult q;
+        if (cudaGetDriverEntryPointByVersion("cuTensorMapEncodeTiled", &f, 12000, cudaEnableDefault,
+                                             &q) != cudaSuccess ||
+            q != cudaDriverEntryPointSuccess)
+            f = nullptr;
+        return reinterpret_cast<Enc>(f);
+    }();
+    if (!enc || nblk % kGrpBlk || (reinterpret_cast<uintptr_t>(w) & 15)) return false;
+    static std::mutex mu;
+    static std::vector<std::pair<std::pair<const void*, long long>, CUtensorMap>> cache;
+    std::lock_guard<std::mutex> lk(mu);
+    const auto key = std::make_pair(w, (long long)n << 32 | (unsigned)nblk);
+    for (auto& e : cache)
+        if (e.first == key) { *m = e.second; return true; }
+    const cuuint64_t dims[2] = {(cuuint64_t)nblk * kBlkBytes, (cuuint64_t)n};
+    const cuuint64_t strides[1] = {(cuuint64_t)nblk * kBlkBytes};
+    const cuuint32_t box[2] = {(cuuint32_t)kGrpBytes, (cuuint32_t)kGrpRows};
+    const cuuint32_t es[2] = {1, 1};
+    if (enc(m, CU_TENSOR_MAP_DATA_TYPE_UINT8, 2, const_cast<void*>(w), dims, strides, box, es,
+            CU_TENSOR_MAP_INTERLEAVE_NONE, CU_TENSOR_MAP_SWIZZLE_NONE,
+            CU_TENSOR_MAP_L2_PROMOTION_L2_256B, CU_TENSOR_MAP_FLOAT_OOB_FILL_NONE) != CUDA_SUCCESS)
+        return false;
+    cache.emplace_back(key, *m);
+    return true;
+}
+
 }  // namespace
 
 bool ptq1_fp4_gemm_supported(int m, int k) {
@@ -655,27 +783,42 @@ bool launch_ptq1_fp4_gemm(const void* a, int m, int k, const void* const* w, voi
         const char* e = getenv("SPARKINFER_PTQ1_FP4_FOLD_A");
         return !(e && e[0] == '0');
     }();
+    // SPARKINFER_PTQ1_FP4_WTMA=0 keeps the decode warps' global weight loads (A/B in one binary).
+    static const bool wtma = [] {
+        const char* e = getenv("SPARKINFER_PTQ1_FP4_WTMA");
+        return !(e && e[0] == '0');
+    }();
+    WMaps maps{};
+    bool wt = fold && wtma;
+    for (int i = 0; wt && i < nleg; i++) wt = weight_group_map(&maps.m[i], w[i], n[i], nblk);
     constexpr size_t smem_f = sizeof(Smem<Ring<true>::NS>), smem_s = sizeof(Smem<Ring<false>::NS>);
+    constexpr size_t smem_w = sizeof(SmemW<Ring<true>::NS>);
     static bool attr = false;
     if (!attr) {
-        cudaFuncSetAttribute(ptq1_fp4_gemm_kernel<true, true>,
+        cudaFuncSetAttribute(ptq1_fp4_gemm_kernel<true, true, false>,
                              cudaFuncAttributeMaxDynamicSharedMemorySize, (int)smem_f);
-        cudaFuncSetAttribute(ptq1_fp4_gemm_kernel<false, true>,
+        cudaFuncSetAttribute(ptq1_fp4_gemm_kernel<false, true, false>,
                              cudaFuncAttributeMaxDynamicSharedMemorySize, (int)smem_f);
-        cudaFuncSetAttribute(ptq1_fp4_gemm_kernel<true, false>,
+        cudaFuncSetAttribute(ptq1_fp4_gemm_kernel<true, false, false>,
                              cudaFuncAttributeMaxDynamicSharedMemorySize, (int)smem_s);
-        cudaFuncSetAttribute(ptq1_fp4_gemm_kernel<false, false>,
+        cudaFuncSetAttribute(ptq1_fp4_gemm_kernel<false, false, false>,
                              cudaFuncAttributeMaxDynamicSharedMemorySize, (int)smem_s);
+        cudaFuncSetAttribute(ptq1_fp4_gemm_kernel<true, true, true>,
+                             cudaFuncAttributeMaxDynamicSharedMemorySize, (int)smem_w);
+        cudaFuncSetAttribute(ptq1_fp4_gemm_kernel<false, true, true>,
+                             cudaFuncAttributeMaxDynamicSharedMemorySize, (int)smem_w);
         attr = true;
     }
     const auto* A = static_cast<const unsigned char*>(a);
     float* P = splits > 1 ? part : nullptr;
     const bool rk = resid && !P;
-#define PTQ1_FP4_GO(R_, F_)                                                                   \
-    ptq1_fp4_gemm_kernel<R_, F_><<<grid, Ring<F_>::THREADS, F_ ? smem_f : smem_s, st>>>(      \
-        A, m, k, L, P, per, mtiles, tiles_n, nitems, alpha)
-    if (fold) { if (rk) PTQ1_FP4_GO(true, true);  else PTQ1_FP4_GO(false, true);  }
-    else      { if (rk) PTQ1_FP4_GO(true, false); else PTQ1_FP4_GO(false, false); }
+#define PTQ1_FP4_GO(R_, F_, W_)                                                               \
+    ptq1_fp4_gemm_kernel<R_, F_, W_>                                                          \
+        <<<grid, Ring<F_>::THREADS, W_ ? smem_w : F_ ? smem_f : smem_s, st>>>(                \
+            A, m, k, L, P, per, mtiles, tiles_n, nitems, alpha, maps)
+    if (wt)        { if (rk) PTQ1_FP4_GO(true, true, true);   else PTQ1_FP4_GO(false, true, true);   }
+    else if (fold) { if (rk) PTQ1_FP4_GO(true, true, false);  else PTQ1_FP4_GO(false, true, false);  }
+    else           { if (rk) PTQ1_FP4_GO(true, false, false); else PTQ1_FP4_GO(false, false, false); }
 #undef PTQ1_FP4_GO
     if (P) {
         for (int i = 0; i < nleg; i++) {
