@@ -28,6 +28,8 @@
 #include <mutex>
 #include <tuple>
 #include <vector>
+#include <cstdint>
+#include <cstring>
 
 namespace sparkinfer { namespace kernels {
 
@@ -857,26 +859,55 @@ __device__ __forceinline__ void mbar_wait(unsigned long long* bar, unsigned pari
                      " selp.u32 %0, 1, 0, p;\n}" : "=r"(done) : "r"(smem_u32(bar)), "r"(parity) : "memory");
 }
 
-// ptq1_mma_rows_kernel with each weight stage brought in by one 2D tensor-map copy (box WSEG
-// bytes x WROWS rows) from one thread, counted on a per-stage mbarrier; the activation is staged
-// as before. Rows past N land as zeros and are never used.
+// A 4-byte cp.async (zero-filled when src_bytes is 0), and the arrive that completes once this
+// thread's earlier cp.asyncs have landed (counted in the barrier's init, not added to it).
+__device__ __forceinline__ void cp_async_4(void* dst, const void* src, unsigned src_bytes) {
+    asm volatile("cp.async.ca.shared.global [%0], [%1], 4, %2;"
+                 :: "r"(smem_u32(dst)), "l"(src), "r"(src_bytes) : "memory");
+}
+__device__ __forceinline__ void cp_async_mbar_arrive(unsigned long long* bar) {
+    asm volatile("cp.async.mbarrier.arrive.noinc.shared::cta.b64 [%0];" :: "r"(smem_u32(bar)) : "memory");
+}
+
+__device__ __forceinline__ void tma_2d(void* dst, const CUtensorMap* m, int x, int y,
+                                       unsigned long long* bar) {
+    asm volatile("cp.async.bulk.tensor.2d.shared::cluster.global.mbarrier::complete_tx::bytes"
+                 " [%0], [%1, {%2, %3}], [%4];"
+                 :: "r"(smem_u32(dst)), "l"(m), "r"(x), "r"(y), "r"(smem_u32(bar)) : "memory");
+}
+__device__ __forceinline__ void tma_3d(void* dst, const CUtensorMap* m, int x, int y, int z,
+                                       unsigned long long* bar) {
+    asm volatile("cp.async.bulk.tensor.3d.shared::cluster.global.mbarrier::complete_tx::bytes"
+                 " [%0], [%1, {%2, %3, %4}], [%5];"
+                 :: "r"(smem_u32(dst)), "l"(m), "r"(x), "r"(y), "r"(z), "r"(smem_u32(bar)) : "memory");
+}
+
+// ptq1_mma_rows_kernel with each stage's weights and activation brought in by one tensor-map copy
+// each, from the first lane of warps 0 and 1, and the stage's scales and sums by one 4-byte
+// cp.async a thread into their interleaved slots (see sds), all counted on a per-stage mbarrier.
+// The weights land as [WROWS][WSEG], the activation as [block][token][128] with the 128-byte
+// swizzle (an ldmatrix's eight token rows land on eight bank groups, as the padded rows did
+// before). Rows past N and tokens past M land as zeros and are never used.
 template <int NT, int WARPS, int KB, int ST, typename OutT, bool SPLIT>
 __global__ void __launch_bounds__(WARPS * 32)
 ptq1_tmaw_rows_kernel(const __grid_constant__ CUtensorMap tw0, const __grid_constant__ CUtensorMap tw1,
-                      const signed char* __restrict__ xq, const float* __restrict__ xd,
-                      const int* __restrict__ xs, const unsigned char* __restrict__ w0,
-                      const unsigned char* __restrict__ w1, OutT* __restrict__ y0,
+                      const __grid_constant__ CUtensorMap tx, const float* __restrict__ xd,
+                      const int* __restrict__ xs, OutT* __restrict__ y0,
                       OutT* __restrict__ y1, int M, int N, int nblk, int ctas_per_mat,
                       float* __restrict__ part, int sps, unsigned* __restrict__ cnt) {
     constexpr int TOK = NT * 8;
-    constexpr int ROWB = KB * kBlk + 16;       // +16: a B-fragment load's 8 tokens hit 8 banks
     constexpr int WSEG = KB * kBlkBytes;       // one weight row's bytes per step
     constexpr int WROWS = WARPS * 16;
+    constexpr int XST = KB * TOK * kBlk;       // a stage's activation bytes
+    constexpr int NTH = WARPS * 32;
+    constexpr int NCP = 2 * KB * TOK < NTH ? 2 * KB * TOK : NTH;   // threads copying a scale or sum
+    static_assert(WARPS >= 2 && 2 * KB * TOK % NCP == 0, "issue map");
     extern __shared__ __align__(128) unsigned char smem_mma[];
-    // A tensor copy's destination is 128-byte aligned; a split launch's static s_last sits first.
-    unsigned char* sw = smem_mma + ((128 - (smem_u32(smem_mma) & 127)) & 127);   // [ST][WROWS][WSEG]
-    signed char* sx = reinterpret_cast<signed char*>(sw + ST * WROWS * WSEG);   // [ST][TOK][ROWB]
-    int* sds = reinterpret_cast<int*>(sx + ST * TOK * ROWB);              // [ST][KB][TOK][2]
+    // The swizzle pattern repeats every 1024 bytes, so the activation tiles start on that
+    // boundary; a split launch's static s_last sits first.
+    unsigned char* sx = smem_mma + ((1024 - (smem_u32(smem_mma) & 1023)) & 1023);   // [ST][KB][TOK][kBlk]
+    unsigned char* sw = sx + ST * XST;                                              // [ST][WROWS][WSEG]
+    int* sds = reinterpret_cast<int*>(sw + ST * WROWS * WSEG);                       // [ST][KB][TOK][2]
     unsigned long long* bar = reinterpret_cast<unsigned long long*>(sds + ST * KB * TOK * 2);
     const int warp = threadIdx.x >> 5, lane = threadIdx.x & 31, g = lane >> 2, t = lane & 3;
     int cta = blockIdx.x, mat = 0;
@@ -888,88 +919,64 @@ ptq1_tmaw_rows_kernel(const __grid_constant__ CUtensorMap tw0, const __grid_cons
     const int s_end = SPLIT ? min(nblk / KB, s_beg + sps) : nblk / KB;
     static_assert(KB * 8 == 32 && KB == 4, "issue map");
     constexpr bool FIT = WARPS == 8;   // the tile never runs past the matrix
-    constexpr int NTH = WARPS * 32;
-    constexpr int XJ = (TOK + WARPS - 1) / WARPS;
     const bool live = FIT || row0 + warp * 16 < N;
-    const signed char* xbase = xq + (size_t)warp * nblk * kBlk + lane * 16;
-    const size_t xstride = (size_t)WARPS * nblk * kBlk;
-    // Tokens past M are zero in every stage from the start; no copy ever lands on them.
-    if (M < TOK)
-        for (int i = threadIdx.x; i < ST * TOK * KB * 8; i += NTH) {
-            const int row = i / (KB * 8), tok = row % TOK;
-            if (tok >= M)
-                *reinterpret_cast<uint4*>(sx + (size_t)row * ROWB + (i % (KB * 8)) * 16) =
-                    make_uint4(0, 0, 0, 0);
-        }
     if (threadIdx.x == 0) {
-        for (int s = 0; s < ST; ++s) mbar_init(bar + s, 1);
+        for (int s = 0; s < ST; ++s) mbar_init(bar + s, 2 + NCP);
         asm volatile("fence.mbarrier_init.release.cluster;" ::: "memory");
         asm volatile("prefetch.tensormap [%0];" :: "l"(tw) : "memory");
+        asm volatile("prefetch.tensormap [%0];" :: "l"(&tx) : "memory");
     }
     __syncthreads();
     auto issue_w = [&](int stp, int buf) {
         if (threadIdx.x != 0) return;
         mbar_expect(bar + buf, WROWS * WSEG);
-        asm volatile("cp.async.bulk.tensor.2d.shared::cluster.global.mbarrier::complete_tx::bytes"
-                     " [%0], [%1, {%2, %3}], [%4];"
-                     :: "r"(smem_u32(sw + (size_t)buf * WROWS * WSEG)), "l"(tw),
-                        "r"(stp * WSEG), "r"(row0), "r"(smem_u32(bar + buf)) : "memory");
+        tma_2d(sw + (size_t)buf * WROWS * WSEG, tw, stp * WSEG, row0, bar + buf);
     };
     auto issue_x = [&](int stp, int buf) {
+        if (threadIdx.x == 32) {
+            mbar_expect(bar + buf, XST);
+            tma_3d(sx + (size_t)buf * XST, &tx, 0, 0, stp * KB, bar + buf);
+        }
+        if (threadIdx.x >= NCP) return;
         const int b0 = stp * KB;
-        signed char* sxs = sx + ((size_t)buf * TOK + warp) * ROWB + lane * 16;
-        const signed char* xstep = xbase + (size_t)b0 * kBlk;
 #pragma unroll
-        for (int j = 0; j < XJ; ++j)
-            if (warp + WARPS * j < M)
-                __pipeline_memcpy_async(sxs + j * WARPS * ROWB, xstep + j * xstride, 16);
-        // Scales and sums are copied like the rest, so no warp stalls on a load before its MMAs,
-        // but one 4-byte value at a time into their interleaved slots (see sds).
-        for (int i = threadIdx.x; i < 2 * KB * TOK; i += NTH) {
+        for (int j = 0; j < 2 * KB * TOK / NCP; ++j) {
+            const int i = threadIdx.x + j * NCP;
             const int which = i & 1, tok = i >> 1 & (TOK - 1), bb = i / (2 * TOK);
             const bool ok = tok < M;
             const size_t src = (size_t)(ok ? tok : 0) * nblk + b0 + bb;
             int* dst = sds + (((size_t)buf * KB + bb) * TOK + tok) * 2 + which;
-            if (which) __pipeline_memcpy_async(dst, xs + src, 4, ok ? 0 : 4);
-            else       __pipeline_memcpy_async(dst, xd + src, 4, ok ? 0 : 4);
+            cp_async_4(dst, which ? (const void*)(xs + src) : (const void*)(xd + src), ok ? 4u : 0u);
         }
-    };
-    auto issue = [&](int stp, int buf) {
-        issue_w(stp, buf);
-        issue_x(stp, buf);
-        __pipeline_commit();
+        cp_async_mbar_arrive(bar + buf);
     };
     float acc[NT][4];
 #pragma unroll
     for (int n = 0; n < NT; ++n) acc[n][0] = acc[n][1] = acc[n][2] = acc[n][3] = 0.f;
     // The weights of the first stages are the kernel's own; only the activation comes from the
-    // launch before it. So they are in flight before the wait (see pdl_wait), and each stage's
-    // group commits once its activation is issued too.
+    // launch before it. So they are in flight before the wait (see pdl_wait).
 #pragma unroll
     for (int s0 = 0; s0 < ST - 1; ++s0)
         if (s_beg + s0 < s_end) issue_w(s_beg + s0, s0);
     pdl_wait();
     pdl_trigger();
 #pragma unroll
-    for (int s0 = 0; s0 < ST - 1; ++s0) {
+    for (int s0 = 0; s0 < ST - 1; ++s0)
         if (s_beg + s0 < s_end) issue_x(s_beg + s0, s0);
-        __pipeline_commit();
-    }
     const int o45 = 4 + (t & 1);
     // ldmatrix row address of this lane: matrix lane / 8 of an x4 is k-step (lane / 16) of the
     // pair, low or high 16 bytes by bit 3, row lane % 8 is the tile's token. Thread (g, t) then
-    // receives bytes 4t..4t+3 of token g's segment, which is the MMA's B fragment. The padded
-    // token rows (ROWB) put a matrix's eight rows on eight different bank groups.
-    const signed char* xl = sx + (size_t)(lane & 7) * ROWB + (lane >> 4) * 32 + (lane >> 3 & 1) * 16;
+    // receives bytes 4t..4t+3 of token g's segment, which is the MMA's B fragment. The swizzle
+    // moved the token row's 16-byte chunk c to c ^ (token % 8).
+    const unsigned char* xl = sx + (size_t)(lane & 7) * kBlk;
+    const int xo0 = ((lane >> 3) ^ (lane & 7)) * 16, xo1 = (((lane >> 3) + 4) ^ (lane & 7)) * 16;
     for (int stp = s_beg; stp < s_end; ++stp) {
         const int buf = (stp - s_beg) % ST;
-        __pipeline_wait_prior(ST - 2);
         mbar_wait(bar + buf, (unsigned)((stp - s_beg) / ST) & 1u);
         __syncthreads();   // this step's data is visible, and the buffer refilled next is idle
         {
             const int nx = stp + ST - 1;
-            if (nx < s_end) issue(nx, (nx - s_beg) % ST);
-            else __pipeline_commit();
+            if (nx < s_end) { issue_w(nx, (nx - s_beg) % ST); issue_x(nx, (nx - s_beg) % ST); }
         }
         if (!live) continue;
         const unsigned char* wa = sw + ((size_t)buf * WROWS + warp * 16 + g) * WSEG;
@@ -990,10 +997,10 @@ ptq1_tmaw_rows_kernel(const __grid_constant__ CUtensorMap tw0, const __grid_cons
                 int cc[4] = {0, 0, 0, 0};
                 // The four k-steps' B fragments in two ldmatrix.x4 (see xl) instead of eight
                 // 4-byte loads: at 32 tokens those loads, not the MMAs, were the kernel's limit.
-                const signed char* xn = xl + ((size_t)buf * TOK + n * 8) * ROWB + bb * kBlk;
+                const unsigned char* xn = xl + (((size_t)buf * KB + bb) * TOK + n * 8) * kBlk;
                 int bv[4][2];
-                ldsm_x4(xn, bv[0][0], bv[0][1], bv[1][0], bv[1][1]);
-                ldsm_x4(xn + 64, bv[2][0], bv[2][1], bv[3][0], bv[3][1]);
+                ldsm_x4(xn + xo0, bv[0][0], bv[0][1], bv[1][0], bv[1][1]);
+                ldsm_x4(xn + xo1, bv[2][0], bv[2][1], bv[3][0], bv[3][1]);
 #pragma unroll
                 for (int s = 0; s < 4; ++s)
                     mma_u8s8(cc, fa[s][0], fb[s][0], fa[s][1], fb[s][1], bv[s][0], bv[s][1]);
@@ -1163,9 +1170,12 @@ inline bool rows_tma_on() {
     return v;
 }
 
-// A 2D tensor map over a [n_rows][nblk * 28] weight matrix, box WSEG bytes x rows. Encoded once per
-// (pointer, shape) and kept: the weights live as long as the model.
-bool weight_tmap(CUtensorMap* m, const void* w, int n_rows, int nblk, int box_rows) {
+// A tensor map of rank 1-3 (dims in elements of esz bytes, strides in bytes for dims 1..),
+// kept once per (pointer, shape): the weights live as long as the model, and the activation
+// buffers are few and reused.
+bool tmap_nd(CUtensorMap* m, const void* p, CUtensorMapDataType ty, int esz, int rank,
+             const cuuint64_t* dims, const cuuint64_t* strides, const cuuint32_t* box,
+             CUtensorMapSwizzle sw, CUtensorMapL2promotion l2) {
     using Enc = CUresult (*)(CUtensorMap*, CUtensorMapDataType, cuuint32_t, void*, const cuuint64_t*,
                              const cuuint64_t*, const cuuint32_t*, const cuuint32_t*,
                              CUtensorMapInterleave, CUtensorMapSwizzle, CUtensorMapL2promotion,
@@ -1178,48 +1188,73 @@ bool weight_tmap(CUtensorMap* m, const void* w, int n_rows, int nblk, int box_ro
             f = nullptr;
         return reinterpret_cast<Enc>(f);
     }();
-    if (!enc) return false;
+    if (!enc || rank < 1 || rank > 3) return false;
+    if ((reinterpret_cast<uintptr_t>(p) & 15) || (cuuint64_t)box[0] * esz % 16) return false;
+    for (int i = 0; i + 1 < rank; ++i)
+        if (strides[i] % 16) return false;
+    struct Key {
+        const void* p; int ty, sw; cuuint64_t d[3], st[2]; cuuint32_t bx[3];
+        bool operator==(const Key& o) const { return memcmp(this, &o, sizeof(Key)) == 0; }
+    };
+    Key key{};
+    key.p = p; key.ty = (int)ty; key.sw = (int)sw;
+    for (int i = 0; i < rank; ++i) { key.d[i] = dims[i]; key.bx[i] = box[i]; }
+    for (int i = 0; i + 1 < rank; ++i) key.st[i] = strides[i];
     static std::mutex mu;
-    static std::vector<std::pair<std::tuple<const void*, int, int, int>, CUtensorMap>> cache;
+    static std::vector<std::pair<Key, CUtensorMap>> cache;
     std::lock_guard<std::mutex> lk(mu);
-    const auto key = std::make_tuple(w, n_rows, nblk, box_rows);
     for (auto& e : cache)
         if (e.first == key) { *m = e.second; return true; }
-    const cuuint64_t dims[2] = {(cuuint64_t)nblk * kBlkBytes, (cuuint64_t)n_rows};
-    const cuuint64_t strides[1] = {(cuuint64_t)nblk * kBlkBytes};
-    const cuuint32_t box[2] = {(cuuint32_t)(kStepBlocks * kBlkBytes), (cuuint32_t)box_rows};
-    const cuuint32_t es[2] = {1, 1};
-    if (enc(m, CU_TENSOR_MAP_DATA_TYPE_UINT8, 2, const_cast<void*>(w), dims, strides, box, es,
-            CU_TENSOR_MAP_INTERLEAVE_NONE, CU_TENSOR_MAP_SWIZZLE_NONE,
-            CU_TENSOR_MAP_L2_PROMOTION_L2_256B, CU_TENSOR_MAP_FLOAT_OOB_FILL_NONE) != CUDA_SUCCESS)
+    const cuuint32_t es[3] = {1, 1, 1};
+    if (enc(m, ty, rank, const_cast<void*>(p), dims, strides, box, es, CU_TENSOR_MAP_INTERLEAVE_NONE,
+            sw, l2, CU_TENSOR_MAP_FLOAT_OOB_FILL_NONE) != CUDA_SUCCESS)
         return false;
+    if (cache.size() >= 4096) cache.erase(cache.begin(), cache.begin() + 2048);
     cache.emplace_back(key, *m);
     return true;
+}
+
+// Weights [n_rows][nblk * 28], box: one step's bytes of box_rows rows.
+bool weight_tmap(CUtensorMap* m, const void* w, int n_rows, int nblk, int box_rows) {
+    const cuuint64_t dims[2] = {(cuuint64_t)nblk * kBlkBytes, (cuuint64_t)n_rows};
+    const cuuint64_t strides[1] = {(cuuint64_t)nblk * kBlkBytes};
+    const cuuint32_t box[2] = {kStepBlocks * kBlkBytes, (cuuint32_t)box_rows};
+    return tmap_nd(m, w, CU_TENSOR_MAP_DATA_TYPE_UINT8, 1, 2, dims, strides, box,
+                   CU_TENSOR_MAP_SWIZZLE_NONE, CU_TENSOR_MAP_L2_PROMOTION_L2_256B);
+}
+
+// Activation [m][nblk * 128] seen as (block bytes, token, block), so one step's box lands as
+// [block][token][128] with the 128-byte swizzle.
+bool act_tmap(CUtensorMap* tx, const signed char* xq, int m, int nblk, int tok) {
+    const cuuint64_t dims[3] = {kBlk, (cuuint64_t)m, (cuuint64_t)nblk};
+    const cuuint64_t strides[2] = {(cuuint64_t)nblk * kBlk, kBlk};
+    const cuuint32_t box[3] = {kBlk, (cuuint32_t)tok, kStepBlocks};
+    return tmap_nd(tx, xq, CU_TENSOR_MAP_DATA_TYPE_UINT8, 1, 3, dims, strides, box,
+                   CU_TENSOR_MAP_SWIZZLE_128B, CU_TENSOR_MAP_L2_PROMOTION_L2_128B);
 }
 
 template <int NT, int WARPS, int ST, typename OutT, bool SPLIT>
 bool launch_tmaw_rows(const signed char* xq, const float* xd, const int* xs, const void* w0,
                       const void* w1, OutT* y0, OutT* y1, int m, int n_rows, int nblk, int ctas,
                       int nmat, int S, int sps, float* part, cudaStream_t st) {
-    constexpr int KB = 4;
-    constexpr size_t shm = (size_t)ST * (WARPS * 16 * KB * kBlkBytes + NT * 8 * (KB * kBlk + 16) +
-                                         NT * 8 * KB * 8) + ST * 8 + 128;
+    constexpr int KB = 4, TOK = NT * 8;
+    constexpr size_t shm = (size_t)ST * (WARPS * 16 * KB * kBlkBytes + KB * TOK * kBlk + KB * TOK * 8) +
+                           ST * 8 + 1024;
     auto kern = ptq1_tmaw_rows_kernel<NT, WARPS, KB, ST, OutT, SPLIT>;
     static const bool attr = [&] {
         cudaFuncSetAttribute(kern, cudaFuncAttributeMaxDynamicSharedMemorySize, (int)shm);
         return true;
     }();
     (void)attr;
-    CUtensorMap t0, t1;
+    CUtensorMap t0, t1, tx;
     if (!weight_tmap(&t0, w0, n_rows, nblk, WARPS * 16)) return false;
     t1 = t0;
     if (w1 && !weight_tmap(&t1, w1, n_rows, nblk, WARPS * 16)) return false;
+    if (!act_tmap(&tx, xq, m, nblk, TOK)) return false;
     unsigned* cnt = SPLIT && WARPS == 8 ? split_cnt_for(st, ctas * nmat) : nullptr;
     if (SPLIT && !cnt) return false;
     launch_rows_pdl(rows_pdl(NT), kern, dim3(ctas * nmat, SPLIT ? S : 1), dim3(WARPS * 32), shm,
-                    st, t0, t1, xq, xd, xs, static_cast<const unsigned char*>(w0),
-                    static_cast<const unsigned char*>(w1), y0, y1, m, n_rows, nblk, ctas, part,
-                    sps, cnt);
+                    st, t0, t1, tx, xd, xs, y0, y1, m, n_rows, nblk, ctas, part, sps, cnt);
     return true;
 }
 
