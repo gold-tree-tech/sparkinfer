@@ -863,6 +863,8 @@ struct SwigluBf16Cfg {
 };
 using SwigluBf16Coop = SwigluBf16Cfg<Shape<_256, _128, _128>>;
 using SwigluBf16PP256 = SwigluBf16Cfg<Shape<_128, _128, _256>, cutlass::gemm::KernelTmaWarpSpecializedPingpong>;
+using SwigluBf16PP128 = SwigluBf16Cfg<Shape<_128, _128, _128>, cutlass::gemm::KernelTmaWarpSpecializedPingpong>;
+using SwigluBf16Coop128 = SwigluBf16Cfg<Shape<_128, _128, _256>>;
 
 // Row r of the interleaved operand is row r/2 of gate (r even) or up (r odd), bytes and scales.
 template <class LayoutS, class LayoutD>
@@ -1419,6 +1421,27 @@ bool wide_fills_better(int m, int n) {
     const long nt = (n + 127) / 128;
     const long big = (long)((m + 255) / 256) * nt, wide = (long)((m + 127) / 128) * nt;
     return fill(wide) > fill(big) + 0.06;
+}
+
+// Outside the fill rule (the GDN projections call the plain launcher) BigM runs unconditionally
+// from 512 rows. At m = 512 the z projection (n = 6144) is then 96 CTAs: a bit over half of one
+// wave, with the rest of the machine idle for the whole launch, and it runs beside the GDN scan,
+// which keeps it on the long side of the pass. The 128x128 tile doubles it to 192 CTAs; measured
+// in the prefill@512 replay (Ternary-Bonsai-2) 65.1 -> 53.7 us a call. The qkv projection
+// (n = 10240, 160 CTAs, 94% of a wave) goes the other way with the same swap (37.8 -> 46.0), so
+// the swap is taken only while the BigM grid leaves more than a quarter of the machine idle.
+// From 1024 rows every grid here is past one wave and nothing changes. The two tiles accumulate
+// in the same order (the fill rule swaps them already). SPARKINFER_NVFP4_SUBWAVE_WIDE=0 keeps
+// BigM (A/B in one binary).
+bool subwave_wide(int m, int n) {
+    static const bool on = [] {
+        const char* e = getenv("SPARKINFER_NVFP4_SUBWAVE_WIDE");
+        return !(e && e[0] == '0');
+    }();
+    const int sms = sm_count();
+    if (!on || sms <= 0) return false;
+    const long big = (long)((m + 255) / 256) * ((n + 127) / 128);
+    return 4 * big < 3 * (long)sms;
 }
 
 template <class C>
@@ -2146,8 +2169,16 @@ bool run_gate_up_swiglu_bf16(const void* a, const void* sa, const void* b_gu, co
            gemm.run(st, nullptr, g_gemm_pdl) == cutlass::Status::kSuccess;
 }
 } // namespace
-// Same tile rule as launch_prefill_nvfp4_gate_up_swiglu (SPARKINFER_GU_SWIGLU_CFG: 0 cooperative,
-// 1 pingpong 128x128x256).
+// The pingpong tile stays on through 512 rows here, one step past the FP4-output launcher's 256.
+// At m = 512 the cooperative 256x128 grid is 544 CTAs on 170 SMs: 3.2 waves, the last one a
+// fifth full, and the GEMM runs at 77% of FP4 peak. Pingpong's 1088 CTAs fill 6.4 waves and its
+// epilogue overlap pays for the extra B re-reads: 141 -> 133 us a call (-6%) in the prefill@512
+// replay of Ternary-Bonsai-2, -1.0% of the pass on its own. At 4096 rows the tail is 0.6 of 25.6
+// waves and pingpong loses 2.8%, so the rule stops where the tail stops mattering. Same
+// accumulation order either way (the fill rule already swaps these two tiles under the plain GEMM).
+// SPARKINFER_GU_SWIGLU_PP_MAX_ROWS=256 is the old rule; SPARKINFER_GU_SWIGLU_CFG forces one tile:
+// 0 cooperative 256x128x128, 1 pingpong 128x128x256, 2 pingpong 128x128x128,
+// 3 cooperative 128x128x256.
 bool launch_prefill_nvfp4_gate_up_swiglu_bf16(const void* a, const void* sa, const void* b_gu,
                                               const void* sb_gu, void* h, int m, int ffn, int k,
                                               float alpha_g, float alpha_u, cudaStream_t st) {
@@ -2157,10 +2188,20 @@ bool launch_prefill_nvfp4_gate_up_swiglu_bf16(const void* a, const void* sa, con
         const char* e = getenv("SPARKINFER_GU_SWIGLU_CFG");
         return e ? atoi(e) : -1;
     }();
-    const int cfg = cfg_env >= 0 ? cfg_env : (m <= 256 ? 1 : 0);
+    static const int pp_max_rows = [] {
+        const char* e = getenv("SPARKINFER_GU_SWIGLU_PP_MAX_ROWS");
+        return e ? atoi(e) : 512;
+    }();
+    const int cfg = cfg_env >= 0 ? cfg_env : (m <= pp_max_rows ? 1 : 0);
     if (cfg == 1)
         return run_gate_up_swiglu_bf16<SwigluBf16PP256>(a, sa, b_gu, sb_gu, h, m, ffn, k, alpha_g,
                                                         alpha_u, st);
+    if (cfg == 2)
+        return run_gate_up_swiglu_bf16<SwigluBf16PP128>(a, sa, b_gu, sb_gu, h, m, ffn, k, alpha_g,
+                                                        alpha_u, st);
+    if (cfg == 3)
+        return run_gate_up_swiglu_bf16<SwigluBf16Coop128>(a, sa, b_gu, sb_gu, h, m, ffn, k,
+                                                          alpha_g, alpha_u, st);
     return run_gate_up_swiglu_bf16<SwigluBf16Coop>(a, sa, b_gu, sb_gu, h, m, ffn, k, alpha_g,
                                                    alpha_u, st);
 }
@@ -2437,7 +2478,7 @@ bool launch_prefill_nvfp4_gemm(const void* a,const void* sa,const void* b,const 
     // grid so the scored ctx=128 shape is untouched, and it falls through if CUTLASS cannot
     // implement the shape.
     const int big = nvfp4_big_tile();
-    if (big && m >= 512 && !(g_gemm_fill && wide_fills_better(m, n))) {
+    if (big && m >= 512 && !(g_gemm_fill && wide_fills_better(m, n)) && !subwave_wide(m, n)) {
         if (run_gemm<BigM>(a,sa,b,sb,d,m,n,k,ws,st,alpha,c)) return true;
 
     }
