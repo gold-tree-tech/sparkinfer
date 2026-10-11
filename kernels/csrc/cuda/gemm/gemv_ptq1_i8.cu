@@ -840,7 +840,9 @@ ptq1_mma_rows_kernel(const signed char* __restrict__ xq, const float* __restrict
     }
 }
 
-// mbarrier and tensor-copy helpers for ptq1_tmaw_rows_kernel.
+// mbarrier and tensor-copy helpers for ptq1_tmaw_rows_kernel. They are sm_90+; on the sm_89 the
+// default build also emits, the kernel is a trap and the host never launches it (rows_tma_on).
+#if !defined(__CUDA_ARCH__) || __CUDA_ARCH__ >= 900
 __device__ __forceinline__ unsigned smem_u32(const void* p) {
     return (unsigned)__cvta_generic_to_shared(p);
 }
@@ -856,6 +858,7 @@ __device__ __forceinline__ void mbar_wait(unsigned long long* bar, unsigned pari
         asm volatile("{\n .reg .pred p;\n mbarrier.try_wait.parity.shared::cta.b64 p, [%1], %2;\n"
                      " selp.u32 %0, 1, 0, p;\n}" : "=r"(done) : "r"(smem_u32(bar)), "r"(parity) : "memory");
 }
+#endif
 
 // ptq1_mma_rows_kernel with each weight stage brought in by one 2D tensor-map copy (box WSEG
 // bytes x WROWS rows) from one thread, counted on a per-stage mbarrier; the activation is staged
@@ -868,6 +871,9 @@ ptq1_tmaw_rows_kernel(const __grid_constant__ CUtensorMap tw0, const __grid_cons
                       const unsigned char* __restrict__ w1, OutT* __restrict__ y0,
                       OutT* __restrict__ y1, int M, int N, int nblk, int ctas_per_mat,
                       float* __restrict__ part, int sps, unsigned* __restrict__ cnt) {
+#if defined(__CUDA_ARCH__) && __CUDA_ARCH__ < 900
+    __trap();
+#else
     constexpr int TOK = NT * 8;
     constexpr int ROWB = KB * kBlk + 16;       // +16: a B-fragment load's 8 tokens hit 8 banks
     constexpr int WSEG = KB * kBlkBytes;       // one weight row's bytes per step
@@ -1070,6 +1076,7 @@ ptq1_tmaw_rows_kernel(const __grid_constant__ CUtensorMap tw0, const __grid_cons
             put<OutT>(y, (size_t)t1 * N + rB, acc[n][3]);
         }
     }
+#endif
 }
 
 // y (and y1 for a pair) = the S partials summed in split order. One thread per 4 outputs.
@@ -1155,10 +1162,14 @@ unsigned* split_cnt_for(cudaStream_t st, int tiles) {
 constexpr bool rows_pdl(int nt) { return nt != 2; }
 
 // SPARKINFER_ROWS_TMA=0 stages the 32-token tile's weights with cp.async (A/B in one binary).
+// Tensor maps and the bulk copy need sm_90+; below that the cp.async kernel runs.
 inline bool rows_tma_on() {
     static const bool v = [] {
         const char* e = getenv("SPARKINFER_ROWS_TMA");
-        return !(e && e[0] == '0');
+        int dev = 0, major = 0;
+        return !(e && e[0] == '0') && cudaGetDevice(&dev) == cudaSuccess &&
+               cudaDeviceGetAttribute(&major, cudaDevAttrComputeCapabilityMajor, dev) == cudaSuccess &&
+               major >= 9;
     }();
     return v;
 }
